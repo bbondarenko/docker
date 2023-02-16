@@ -2,15 +2,43 @@
 # Azkaban + kafka + spark + hadoop
 #
 ARG BASE_IMAGE_TAG
+# Build stage
+FROM openjdk:${BASE_IMAGE_TAG:-8u342-jre} AS builder
 ARG KAFKA_VERSION
 ARG SCALA_VERSION
 ARG SPARK_SCALA
 ARG HADOOP_VERSION
 ARG AZ_VERSION
+ARG AZ_TYPE
 
+## Build
+### tooling
+RUN apt-get update \
+ && apt-get install -y git curl gcc g++
+
+### AZKABAN
+ENV AZ_VERSION ${AZ_VERSION:-3.90.0}
+ENV NATIVE_ARTIFACTS azkaban-solo-server-${AZ_VERSION}.tar.gz azkaban-exec-server-${AZ_VERSION}.tar.gz azkaban-web-server-${AZ_VERSION}.tar.gz main
+RUN mkdir /build \
+    && cd /build \
+    && git clone https://github.com/azkaban/azkaban.git \
+    && cd /build/azkaban \
+    && git checkout $AZ_VERSION \
+    && ./gradlew clean build installDist -x test \
+    && mkdir /artifacts \
+    && for p in $(echo "${NATIVE_ARTIFACTS}" | sed -e "s/ /\\n/g") ; do find /build -type f -name ${p} -exec cp {} /artifacts/ \;  ; done \
+    && find . -not -path  "*server*" -name "*-3.90.0.jar" -exec cp {} /artifacts/ \;
+
+# Final image
+ARG BASE_IMAGE_TAG
 FROM openjdk:${BASE_IMAGE_TAG:-8u342-jre}
-
 LABEL MAINTAINER=borisbond@gmail.com
+ARG KAFKA_VERSION
+ARG SCALA_VERSION
+ARG SPARK_SCALA
+ARG HADOOP_VERSION
+ARG AZ_VERSION
+ARG AZ_TYPE
 
 ## Install
 ### locale
@@ -31,7 +59,7 @@ ENV LC_ALL en_US.UTF-8
 
 ### tooling
 RUN apt-get update \
- && apt-get install -y git jq  curl nfs-common default-mysql-client \
+ && apt-get install -y jq curl nfs-common default-mysql-client \
     curl python3 python3-setuptools python3-pip \
 &&  ln -s /usr/bin/python3 /usr/bin/python \
 &&  pip3 install requests databricks-cli
@@ -77,25 +105,18 @@ RUN curl -sL --retry 3 \
  && mv /usr/$SPARK_PACKAGE $SPARK_HOME \
  && chown -R root:root $SPARK_HOME
 
-COPY ./entrypoint.sh /bin/
-
-RUN chmod 755 /bin/entrypoint.sh
-
-#COPY core-site.xml /usr/hadoop-${HADOOP_VERSION}/etc/hadoop/
-# ^^^ replace with config map
+### Artifacts
+ENV AZ_VERSION ${AZ_VERSION:-3.90.0}
+RUN mkdir /artifacts
+COPY --from=builder /artifacts /artifacts/
 
 ### AZKABAN
-ENV AZ_VERSION ${AZ_VERSION:-3.90.0}
-RUN mkdir /build \
-    && cd /build \
-    && git clone https://github.com/azkaban/azkaban.git \
-    && cd /build/azkaban \
-    && git checkout $AZ_VERSION \
-    && ./gradlew clean build installDist -x test \
-    && tar xzf /build/azkaban/azkaban-solo-server/build/distributions/azkaban-solo-server-$AZ_VERSION.tar.gz -C /opt \
-    && ln -s /opt/azkaban-solo-server-$AZ_VERSION /opt/azkaban
+ENV AZ_TYPE ${AZ_TYPE:-solo}
+RUN  tar xzf /artifacts/azkaban-${AZ_TYPE}-server-${AZ_VERSION}.tar.gz -C /opt \
+    && ln -s /opt/azkaban-${AZ_TYPE}-server-${AZ_VERSION} /opt/azkaban && mkdir -p /opt/azkaban/logs \
+    && sed -i 's/\$@ &$/\$@/' /opt/azkaban/bin/internal/*start-${AZ_TYPE}*.sh
+ENV AZ_TYPE ${AZ_TYPE:-solo}
+COPY ./entrypoint.${AZ_TYPE}.sh /bin/entrypoint.sh
+RUN chmod 755 /bin/entrypoint.sh
 
-
-# patch start scrip
-RUN sed -i 's/\$@ &$/\$@/' /opt/azkaban/bin/internal/internal-start-solo-server.sh
 ENTRYPOINT ["/bin/entrypoint.sh"]
